@@ -1,0 +1,106 @@
+import os
+from datetime import datetime
+
+from fastapi import APIRouter, HTTPException, Request
+from sqlalchemy import DateTime, Integer, String, Text, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from resend_mailer import verify_resend_webhook
+
+
+class TrackingBase(DeclarativeBase):
+    pass
+
+
+class EmailDelivery(TrackingBase):
+    __tablename__ = "email_deliveries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shopify_order_id: Mapped[str] = mapped_column(String(64), index=True)
+    kind: Mapped[str] = mapped_column(String(64), index=True)
+    resend_email_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    recipient: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(64), default="sent", index=True)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+def init_email_tracking(engine):
+    TrackingBase.metadata.create_all(bind=engine)
+
+
+def record_email(db, *, order_id: str, kind: str, email_id: str, recipient: str, status: str = "sent"):
+    if not email_id:
+        return None
+    row = db.scalar(select(EmailDelivery).where(EmailDelivery.resend_email_id == email_id))
+    if row:
+        row.status = status
+        row.recipient = recipient or row.recipient
+        db.commit()
+        return row
+    row = EmailDelivery(
+        shopify_order_id=order_id,
+        kind=kind,
+        resend_email_id=email_id,
+        recipient=recipient or "",
+        status=status,
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
+def latest_customer_delivery(db, order_id: str):
+    return db.scalar(
+        select(EmailDelivery)
+        .where(
+            EmailDelivery.shopify_order_id == order_id,
+            EmailDelivery.kind == "customer_review",
+        )
+        .order_by(EmailDelivery.created_at.desc())
+    )
+
+
+def build_resend_webhook_router(SessionLocal):
+    router = APIRouter()
+
+    @router.post("/webhooks/resend")
+    async def resend_webhook(request: Request):
+        raw = await request.body()
+        secret = os.getenv("RESEND_WEBHOOK_SECRET", "")
+        if not secret:
+            raise HTTPException(503, "RESEND_WEBHOOK_SECRET not configured")
+        try:
+            event = verify_resend_webhook(raw, request.headers, secret)
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(401, "Invalid Resend webhook signature") from exc
+
+        event_type = str(event.get("type") or "")
+        data = event.get("data") or {}
+        email_id = str(data.get("email_id") or "")
+        if not email_id or not event_type.startswith("email."):
+            return {"ok": True, "ignored": True}
+
+        status = event_type.removeprefix("email.")
+        detail = ""
+        if status == "bounced":
+            bounce = data.get("bounce") or {}
+            detail = str(bounce.get("message") or bounce.get("type") or "")
+        elif status == "failed":
+            detail = str(data.get("error") or data.get("message") or "")
+        elif status == "delivery_delayed":
+            detail = str(data.get("reason") or "")
+
+        with SessionLocal() as db:
+            row = db.scalar(select(EmailDelivery).where(EmailDelivery.resend_email_id == email_id))
+            if row:
+                row.status = status
+                row.detail = detail
+                db.commit()
+
+        return {"ok": True}
+
+    return router
