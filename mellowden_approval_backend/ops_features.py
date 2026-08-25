@@ -281,7 +281,7 @@ def fetch_abandoned_checkouts(settings):
         return []
     query = """
 query MellowdenAbandonedCheckouts($first: Int!) {
-  abandonedCheckouts(first: $first, reverse: true, sortKey: UPDATED_AT, query: "status:open recovery_state:not_recovered") {
+  abandonedCheckouts(first: $first, reverse: true, sortKey: CREATED_AT, query: "status:open recovery_state:not_recovered") {
     nodes {
       id
       createdAt
@@ -323,7 +323,7 @@ def _reminder_state(db, order_id: str, kind: str, marker: str):
 
 
 def process_review_reminders(settings, SessionLocal, ApprovalOrder, customer_review_url):
-    thresholds = [int(settings.review_reminder_hours), int(settings.review_reminder_hours) * 2]
+    delay_hours = max(1, int(settings.review_reminder_hours))
     now = datetime.utcnow()
     with SessionLocal() as db:
         rows = db.scalars(
@@ -332,11 +332,12 @@ def process_review_reminders(settings, SessionLocal, ApprovalOrder, customer_rev
         for row in rows:
             state = _reminder_state(db, row.shopify_order_id, "customer_review", row.approval_token)
             sequence = state.count + 1
-            if sequence > len(thresholds):
+            if sequence > 2:
                 continue
             base_event = latest_event(db, row.shopify_order_id, "ARTWORK_UPLOADED")
             base_time = base_event.created_at if base_event else row.updated_at
-            if not base_time or now - base_time < timedelta(hours=thresholds[sequence - 1]):
+            due_from = state.last_sent_at if state.count > 0 and state.last_sent_at else base_time
+            if not due_from or now - due_from < timedelta(hours=delay_hours):
                 continue
             try:
                 send_customer_review_reminder(
