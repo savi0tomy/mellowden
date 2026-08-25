@@ -10,6 +10,10 @@ RESEND_ENDPOINT = "https://api.resend.com/emails"
 REVIEW_TEMPLATE = "mellowden-portrait-ready"
 APPROVED_TEMPLATE = "mellowden-portrait-approved"
 REVISION_TEMPLATE = "mellowden-revision-requested"
+REVIEW_REMINDER_TEMPLATE = "mellowden-review-reminder"
+OWNER_ALERT_TEMPLATE = "mellowden-owner-alert"
+DAILY_DIGEST_TEMPLATE = "mellowden-daily-digest"
+ABANDONED_CHECKOUT_TEMPLATE = "mellowden-abandoned-checkout"
 WEBHOOK_TOLERANCE_SECONDS = 300
 
 
@@ -38,7 +42,7 @@ def _send_template(settings, *, to_email: str, template_id: str, variables: dict
         headers={
             "Authorization": f"Bearer {settings.resend_api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "mellowden-approval-backend/1.1",
+            "User-Agent": "mellowden-approval-backend/1.2",
             "Idempotency-Key": idempotency_key,
         },
         method="POST",
@@ -76,6 +80,21 @@ def send_customer_review_email(settings, row, review_url: str):
     )
 
 
+def send_customer_review_reminder(settings, row, review_url: str, sequence: int):
+    return _send_template(
+        settings,
+        to_email=row.customer_email,
+        template_id=REVIEW_REMINDER_TEMPLATE,
+        variables={
+            "ORDER_NAME": row.order_name or row.shopify_order_id,
+            "PET_NAME": row.pet_name or "your pet",
+            "REVIEW_URL": review_url,
+        },
+        idempotency_key=f"mellowden-review-reminder/{row.shopify_order_id}/{row.approval_token}/{sequence}",
+        tags={"order_id": row.shopify_order_id, "kind": "customer_review_reminder"},
+    )
+
+
 def send_owner_approved_email(settings, row):
     if not settings.owner_notification_email:
         raise RuntimeError("OWNER_NOTIFICATION_EMAIL is not configured")
@@ -88,7 +107,7 @@ def send_owner_approved_email(settings, row):
             "CUSTOMER_EMAIL": row.customer_email or "—",
             "PET_NAME": row.pet_name or "—",
             "PRODUCT_TITLE": row.product_title or "Mellowden portrait",
-            "ADMIN_URL": "https://mellowden-approval-backend-production.up.railway.app/admin",
+            "ADMIN_URL": f"{settings.app_base_url.rstrip('/')}/admin",
         },
         idempotency_key=f"mellowden-approved/{row.shopify_order_id}/{row.approval_token}",
         tags={"order_id": row.shopify_order_id, "kind": "owner_approved"},
@@ -108,10 +127,70 @@ def send_owner_revision_email(settings, row, message: str):
             "PET_NAME": row.pet_name or "—",
             "PRODUCT_TITLE": row.product_title or "Mellowden portrait",
             "REVISION_MESSAGE": message,
-            "ADMIN_URL": "https://mellowden-approval-backend-production.up.railway.app/admin",
+            "ADMIN_URL": f"{settings.app_base_url.rstrip('/')}/admin",
         },
         idempotency_key=f"mellowden-revision/{row.shopify_order_id}/{row.approval_token}/{row.revision_count}",
         tags={"order_id": row.shopify_order_id, "kind": "owner_revision"},
+    )
+
+
+def send_owner_alert(settings, row, title: str, message: str, key_suffix: str):
+    if not settings.owner_notification_email:
+        raise RuntimeError("OWNER_NOTIFICATION_EMAIL is not configured")
+    order_id = row.shopify_order_id if row is not None else "store"
+    order_name = (row.order_name or row.shopify_order_id) if row is not None else "—"
+    customer_email = (row.customer_email or "—") if row is not None else "—"
+    pet_name = (row.pet_name or "—") if row is not None else "—"
+    return _send_template(
+        settings,
+        to_email=settings.owner_notification_email,
+        template_id=OWNER_ALERT_TEMPLATE,
+        variables={
+            "ALERT_TITLE": title,
+            "ORDER_NAME": order_name,
+            "CUSTOMER_EMAIL": customer_email,
+            "PET_NAME": pet_name,
+            "MESSAGE": message,
+            "ADMIN_URL": f"{settings.app_base_url.rstrip('/')}/admin",
+        },
+        idempotency_key=f"mellowden-owner-alert/{order_id}/{key_suffix}",
+        tags={"order_id": order_id, "kind": "owner_alert"},
+    )
+
+
+def send_daily_digest(settings, *, date_label: str, counts: dict, overdue_summary: str):
+    if not settings.owner_notification_email:
+        raise RuntimeError("OWNER_NOTIFICATION_EMAIL is not configured")
+    return _send_template(
+        settings,
+        to_email=settings.owner_notification_email,
+        template_id=DAILY_DIGEST_TEMPLATE,
+        variables={
+            "DATE_LABEL": date_label,
+            "WAITING_ARTWORK": int(counts.get("WAITING_FOR_ARTWORK", 0)),
+            "WAITING_CUSTOMER": int(counts.get("WAITING_FOR_CUSTOMER_APPROVAL", 0)),
+            "REVISION_REQUESTED": int(counts.get("REVISION_REQUESTED", 0)),
+            "APPROVED": int(counts.get("APPROVED", 0)),
+            "SENT_TO_PRINT": int(counts.get("SENT_TO_PRINT", 0)),
+            "OVERDUE_SUMMARY": overdue_summary or "No overdue actions.",
+            "ADMIN_URL": f"{settings.app_base_url.rstrip('/')}/admin",
+        },
+        idempotency_key=f"mellowden-daily-digest/{date_label}",
+        tags={"order_id": "store", "kind": "daily_digest"},
+    )
+
+
+def send_abandoned_checkout_email(settings, *, checkout_id: str, email: str, recovery_url: str, product_summary: str):
+    return _send_template(
+        settings,
+        to_email=email,
+        template_id=ABANDONED_CHECKOUT_TEMPLATE,
+        variables={
+            "RECOVERY_URL": recovery_url,
+            "PRODUCT_SUMMARY": product_summary or "your personalized Mellowden portrait",
+        },
+        idempotency_key=f"mellowden-abandoned/{checkout_id}",
+        tags={"order_id": f"checkout-{checkout_id}", "kind": "abandoned_checkout"},
     )
 
 
