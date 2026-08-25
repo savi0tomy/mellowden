@@ -1,6 +1,9 @@
-import base64, hashlib, hmac, secrets, smtplib
+import base64
+import hashlib
+import hmac
+import logging
+import secrets
 from datetime import datetime
-from email.message import EmailMessage
 from html import escape
 from typing import Optional
 
@@ -10,7 +13,15 @@ from pydantic import BaseModel, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine, String, Text, Integer, DateTime, select
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, sessionmaker, Session
+
 from admin_dashboard import build_admin_router
+from resend_mailer import (
+    send_customer_review_email,
+    send_owner_approved_email,
+    send_owner_revision_email,
+)
+
+logger = logging.getLogger("mellowden")
 
 
 class Settings(BaseSettings):
@@ -19,6 +30,13 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./mellowden.db"
     shopify_webhook_secret: str = ""
     admin_api_key: str = "change-this"
+
+    # Resend transactional email
+    resend_api_key: str = ""
+    resend_from_email: str = ""
+    owner_notification_email: str = ""
+
+    # Legacy SMTP settings retained so old Railway variables remain harmless.
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = ""
@@ -26,6 +44,7 @@ class Settings(BaseSettings):
     smtp_from_email: str = ""
     smtp_from_name: str = "Mellowden"
     smtp_use_tls: bool = True
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
@@ -124,44 +143,30 @@ def customer_review_url(token: str) -> str:
     return f"{base}{separator}token={token}"
 
 
-def send_review_email(to_email, order_name, review_url):
-    if not settings.smtp_host or not settings.smtp_from_email:
-        raise RuntimeError("SMTP not configured")
-    msg = EmailMessage()
-    msg["Subject"] = f"Your Mellowden portrait is ready to review — {order_name}"
-    msg["From"] = f"{settings.smtp_from_name} <{settings.smtp_from_email}>"
-    msg["To"] = to_email
-    msg.set_content(
-        f"""Your personalized Mellowden portrait is ready to review.
-
-Review your artwork:
-{review_url}
-
-You can approve it for printing or request changes.
-
-Nothing is sent to print until you approve the artwork.
-"""
-    )
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
-        if settings.smtp_use_tls:
-            server.starttls()
-        if settings.smtp_username:
-            server.login(settings.smtp_username, settings.smtp_password)
-        server.send_message(msg)
-
-
 class ArtworkInput(BaseModel):
     artwork_url: HttpUrl
     send_email: bool = True
 
 
 app = FastAPI(title="Mellowden Artwork Approval")
-app.include_router(build_admin_router(settings, SessionLocal, ApprovalOrder, new_token, customer_review_url))
+app.include_router(
+    build_admin_router(
+        settings,
+        SessionLocal,
+        ApprovalOrder,
+        new_token,
+        customer_review_url,
+        send_customer_review_email,
+    )
+)
 
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "resend_configured": bool(settings.resend_api_key and settings.resend_from_email),
+    }
 
 
 @app.post("/webhooks/shopify/orders-create")
@@ -228,21 +233,32 @@ def set_artwork(order_id: str, body: ArtworkInput, db: Session = Depends(get_db)
     row = db.scalar(select(ApprovalOrder).where(ApprovalOrder.shopify_order_id == order_id))
     if not row:
         raise HTTPException(404, "Order not found")
+
     row.artwork_url = str(body.artwork_url)
     row.approval_token = new_token()
     row.revision_request = ""
     row.approved_at = None
     row.status = "WAITING_FOR_CUSTOMER_APPROVAL"
     db.commit()
+    db.refresh(row)
+
     review_url = customer_review_url(row.approval_token)
-    email_sent, email_error = False, None
+    email_sent = False
+    email_error = None
     if body.send_email:
         try:
-            send_review_email(row.customer_email, row.order_name, review_url)
+            send_customer_review_email(settings, row, review_url)
             email_sent = True
-        except Exception as e:
-            email_error = str(e)
-    return {"ok": True, "review_url": review_url, "email_sent": email_sent, "email_error": email_error}
+        except Exception as exc:
+            email_error = str(exc)
+            logger.exception("Resend review email failed for %s", row.order_name)
+
+    return {
+        "ok": True,
+        "review_url": review_url,
+        "email_sent": email_sent,
+        "email_error": email_error,
+    }
 
 
 def page(title, body, eyebrow="Mellowden Portrait Review"):
@@ -352,16 +368,17 @@ def review(token: str, db: Session = Depends(get_db)):
         )
 
     artwork_url = escape(row.artwork_url, quote=True)
+    safe_token = escape(token, quote=True)
     body = f"""
 {meta}
 <div class="status">Ready for review</div>
 <p>Please look over your portrait carefully. Approve it when you’re happy, or tell us what you’d like adjusted.</p>
 <div class="preview"><img src="{artwork_url}" alt="Your Mellowden artwork preview"></div>
 <div class="actions">
-<form method="post" action="/review/{escape(token, quote=True)}/approve"><button class="primary">Approve for printing</button></form>
+<form method="post" action="/review/{safe_token}/approve"><button class="primary">Approve for printing</button></form>
 <button class="secondary" type="button" onclick="document.getElementById('changes').hidden=false;this.hidden=true">Request changes</button>
 </div>
-<form id="changes" hidden method="post" action="/review/{escape(token, quote=True)}/request-changes">
+<form id="changes" hidden method="post" action="/review/{safe_token}/request-changes">
 <textarea name="message" maxlength="1500" required placeholder="Tell us what you'd like changed..."></textarea>
 <button class="secondary" type="submit">Send change request</button>
 </form>
@@ -379,9 +396,18 @@ def approve(token: str, db: Session = Depends(get_db)):
         return page("Approved for printing", "<p>Thank you. Your artwork is already approved.</p>")
     if row.status != "WAITING_FOR_CUSTOMER_APPROVAL":
         return page("No action needed", "<p>This artwork is no longer awaiting approval.</p>")
+
     row.status = "APPROVED"
     row.approved_at = datetime.utcnow()
     db.commit()
+    db.refresh(row)
+
+    try:
+        send_owner_approved_email(settings, row)
+    except Exception:
+        # Never make the customer's approval fail because a notification email failed.
+        logger.exception("Resend owner approval notification failed for %s", row.order_name)
+
     return page(
         "Approved for printing",
         "<div class='status'>Approved</div><p>Thank you. We’ll now prepare your portrait for production.</p>",
@@ -397,13 +423,23 @@ def request_changes(token: str, message: str = Form(...), db: Session = Depends(
         return page("Changes received", "<p>Your change request is already with our artist.</p>")
     if row.status != "WAITING_FOR_CUSTOMER_APPROVAL":
         return page("No action needed", "<p>This artwork is no longer awaiting feedback.</p>")
+
     message = message.strip()
     if not message or len(message) > 1500:
         raise HTTPException(400, "Invalid change request")
+
     row.revision_request = message
     row.revision_count += 1
     row.status = "REVISION_REQUESTED"
     db.commit()
+    db.refresh(row)
+
+    try:
+        send_owner_revision_email(settings, row, message)
+    except Exception:
+        # The revision is already saved; an email outage must not lose the customer's feedback.
+        logger.exception("Resend owner revision notification failed for %s", row.order_name)
+
     return page(
         "Your changes are with our artist",
         "<div class='status'>Revision requested</div><p>Thanks. We’ll prepare a revised preview and send you a fresh review link when it’s ready.</p>",
