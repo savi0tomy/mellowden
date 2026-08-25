@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from sqlalchemy import DateTime, Integer, String, Text, select, func
+from sqlalchemy import DateTime, Integer, String, Text, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from resend_mailer import (
@@ -13,6 +13,11 @@ from resend_mailer import (
     send_customer_review_reminder,
     send_daily_digest,
     send_owner_alert,
+)
+from shopify_auth import (
+    get_shopify_admin_token,
+    invalidate_shopify_admin_token,
+    shopify_admin_configured,
 )
 
 logger = logging.getLogger("mellowden.ops")
@@ -154,35 +159,50 @@ def shopify_admin_order_url(settings, order_id: str) -> str:
 
 def _shopify_graphql(settings, query: str, variables: dict):
     domain = (settings.shopify_store_domain or "").strip().replace("https://", "").rstrip("/")
-    token = (settings.shopify_admin_access_token or "").strip()
-    if not domain or not token:
+    if not domain or not shopify_admin_configured(settings):
         return None
-    url = f"https://{domain}/admin/api/2026-07/graphql.json"
-    request = Request(
-        url,
-        data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "X-Shopify-Access-Token": token,
-            "User-Agent": "mellowden-approval-backend/1.2",
-        },
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=20) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Shopify Admin API rejected request ({exc.code}): {detail[:500]}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Could not reach Shopify Admin API: {exc.reason}") from exc
+
+    def execute(token: str):
+        request = Request(
+            f"https://{domain}/admin/api/2026-07/graphql.json",
+            data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Shopify-Access-Token": token,
+                "User-Agent": "mellowden-approval-backend/1.3",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code in (401, 403):
+                return {"_auth_error": True, "_status": exc.code, "_detail": detail[:500]}
+            raise RuntimeError(f"Shopify Admin API rejected request ({exc.code}): {detail[:500]}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Could not reach Shopify Admin API: {exc.reason}") from exc
+
+    token = get_shopify_admin_token(settings)
+    result = execute(token)
+    if result.get("_auth_error"):
+        # Client-credentials tokens expire after 24h. Invalidate and retry once.
+        invalidate_shopify_admin_token()
+        token = get_shopify_admin_token(settings, force_refresh=True)
+        result = execute(token)
+        if result.get("_auth_error"):
+            raise RuntimeError(
+                f"Shopify Admin API authentication failed ({result.get('_status')}): {result.get('_detail', '')}"
+            )
+
     if result.get("errors"):
         raise RuntimeError(f"Shopify GraphQL errors: {result['errors'][:3]}")
     return result.get("data") or {}
 
 
 def sync_shopify_order_metadata(settings, row, review_url: str):
-    if not settings.shopify_admin_access_token:
+    if not shopify_admin_configured(settings):
         return False
     order_gid = f"gid://shopify/Order/{row.shopify_order_id}"
     tag = STATUS_TAGS.get(row.status, "mellowden:portrait")
@@ -233,7 +253,7 @@ mutation SyncMellowdenOrder($id: ID!, $remove: [String!]!, $add: [String!]!, $me
 
 
 def fetch_shopify_order_snapshot(settings, db, order_id: str):
-    if not settings.shopify_admin_access_token:
+    if not shopify_admin_configured(settings):
         return None
     query = """
 query MellowdenOrderLive($id: ID!) {
@@ -277,7 +297,7 @@ def _parse_shopify_datetime(value: str | None):
 
 
 def fetch_abandoned_checkouts(settings):
-    if not settings.shopify_admin_access_token:
+    if not shopify_admin_configured(settings):
         return []
     query = """
 query MellowdenAbandonedCheckouts($first: Int!) {
@@ -470,7 +490,7 @@ def process_abandoned_checkouts(settings, SessionLocal):
 
 
 def refresh_shopify_snapshots(settings, SessionLocal, ApprovalOrder):
-    if not settings.shopify_admin_access_token:
+    if not shopify_admin_configured(settings):
         return
     with SessionLocal() as db:
         rows = db.scalars(
