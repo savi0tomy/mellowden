@@ -30,27 +30,6 @@ def init_email_tracking(engine):
     TrackingBase.metadata.create_all(bind=engine)
 
 
-def record_email(db, *, order_id: str, kind: str, email_id: str, recipient: str, status: str = "sent"):
-    if not email_id:
-        return None
-    row = db.scalar(select(EmailDelivery).where(EmailDelivery.resend_email_id == email_id))
-    if row:
-        row.status = status
-        row.recipient = recipient or row.recipient
-        db.commit()
-        return row
-    row = EmailDelivery(
-        shopify_order_id=order_id,
-        kind=kind,
-        resend_email_id=email_id,
-        recipient=recipient or "",
-        status=status,
-    )
-    db.add(row)
-    db.commit()
-    return row
-
-
 def latest_customer_delivery(db, order_id: str):
     return db.scalar(
         select(EmailDelivery)
@@ -62,8 +41,21 @@ def latest_customer_delivery(db, order_id: str):
     )
 
 
+def _tags_dict(raw_tags) -> dict:
+    if isinstance(raw_tags, dict):
+        return {str(k): str(v) for k, v in raw_tags.items()}
+    if isinstance(raw_tags, list):
+        return {
+            str(item.get("name")): str(item.get("value") or "")
+            for item in raw_tags
+            if isinstance(item, dict) and item.get("name")
+        }
+    return {}
+
+
 def build_resend_webhook_router(SessionLocal):
     router = APIRouter()
+    init_email_tracking(SessionLocal.kw["bind"])
 
     @router.post("/webhooks/resend")
     async def resend_webhook(request: Request):
@@ -84,6 +76,11 @@ def build_resend_webhook_router(SessionLocal):
         if not email_id or not event_type.startswith("email."):
             return {"ok": True, "ignored": True}
 
+        tags = _tags_dict(data.get("tags"))
+        order_id = tags.get("order_id", "")
+        kind = tags.get("kind", "")
+        to = data.get("to") or []
+        recipient = str(to[0] if isinstance(to, list) and to else to or "")
         status = event_type.removeprefix("email.")
         detail = ""
         if status == "bounced":
@@ -96,10 +93,23 @@ def build_resend_webhook_router(SessionLocal):
 
         with SessionLocal() as db:
             row = db.scalar(select(EmailDelivery).where(EmailDelivery.resend_email_id == email_id))
-            if row:
+            if not row:
+                row = EmailDelivery(
+                    shopify_order_id=order_id,
+                    kind=kind,
+                    resend_email_id=email_id,
+                    recipient=recipient,
+                    status=status,
+                    detail=detail,
+                )
+                db.add(row)
+            else:
+                row.shopify_order_id = order_id or row.shopify_order_id
+                row.kind = kind or row.kind
+                row.recipient = recipient or row.recipient
                 row.status = status
                 row.detail = detail
-                db.commit()
+            db.commit()
 
         return {"ok": True}
 
