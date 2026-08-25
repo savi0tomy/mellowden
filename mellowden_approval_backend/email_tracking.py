@@ -35,7 +35,7 @@ def latest_customer_delivery(db, order_id: str):
         select(EmailDelivery)
         .where(
             EmailDelivery.shopify_order_id == order_id,
-            EmailDelivery.kind == "customer_review",
+            EmailDelivery.kind.in_(["customer_review", "customer_review_reminder"]),
         )
         .order_by(EmailDelivery.created_at.desc())
     )
@@ -53,7 +53,7 @@ def _tags_dict(raw_tags) -> dict:
     return {}
 
 
-def build_resend_webhook_router(SessionLocal):
+def build_resend_webhook_router(SessionLocal, settings=None, ApprovalOrder=None, send_owner_alert_fn=None):
     router = APIRouter()
     init_email_tracking(SessionLocal.kw["bind"])
 
@@ -91,8 +91,10 @@ def build_resend_webhook_router(SessionLocal):
         elif status == "delivery_delayed":
             detail = str(data.get("reason") or "")
 
+        should_alert = False
         with SessionLocal() as db:
             row = db.scalar(select(EmailDelivery).where(EmailDelivery.resend_email_id == email_id))
+            previous_status = row.status if row else ""
             if not row:
                 row = EmailDelivery(
                     shopify_order_id=order_id,
@@ -110,6 +112,28 @@ def build_resend_webhook_router(SessionLocal):
                 row.status = status
                 row.detail = detail
             db.commit()
+            should_alert = (
+                status in {"bounced", "failed", "complained", "suppressed"}
+                and previous_status != status
+                and kind in {"customer_review", "customer_review_reminder", "abandoned_checkout"}
+                and bool(order_id)
+            )
+
+            if should_alert and settings and ApprovalOrder and send_owner_alert_fn and order_id and not order_id.startswith("checkout-"):
+                portrait_order = db.scalar(
+                    select(ApprovalOrder).where(ApprovalOrder.shopify_order_id == order_id)
+                )
+                if portrait_order:
+                    try:
+                        send_owner_alert_fn(
+                            settings,
+                            portrait_order,
+                            "Customer email needs attention",
+                            f"Resend reported {status} for {recipient or 'the customer'}. {detail or 'Open the dashboard and use the manual email fallback if needed.'}",
+                            f"delivery-{email_id}-{status}",
+                        )
+                    except Exception:
+                        pass
 
         return {"ok": True}
 
