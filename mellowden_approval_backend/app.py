@@ -1,6 +1,7 @@
 import base64, hashlib, hmac, secrets, smtplib
 from datetime import datetime
 from email.message import EmailMessage
+from html import escape
 from typing import Optional
 
 from fastapi import FastAPI, Request, Depends, HTTPException, Header, Form
@@ -10,8 +11,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine, String, Text, Integer, DateTime, select
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, sessionmaker, Session
 
+
 class Settings(BaseSettings):
     app_base_url: str = "http://localhost:8000"
+    storefront_review_url: str = "https://mellowden.store/pages/review"
     database_url: str = "sqlite:///./mellowden.db"
     shopify_webhook_secret: str = ""
     admin_api_key: str = "change-this"
@@ -23,6 +26,7 @@ class Settings(BaseSettings):
     smtp_from_name: str = "Mellowden"
     smtp_use_tls: bool = True
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
 
 settings = Settings()
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
@@ -38,8 +42,10 @@ if database_url.startswith("postgresql://"):
 engine = create_engine(database_url, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
+
 class Base(DeclarativeBase):
     pass
+
 
 class ApprovalOrder(Base):
     __tablename__ = "approval_orders"
@@ -64,7 +70,9 @@ class ApprovalOrder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+
 Base.metadata.create_all(bind=engine)
+
 
 def get_db():
     db = SessionLocal()
@@ -72,6 +80,7 @@ def get_db():
         yield db
     finally:
         db.close()
+
 
 def verify_webhook(raw: bytes, received: str | None):
     if not settings.shopify_webhook_secret:
@@ -82,12 +91,15 @@ def verify_webhook(raw: bytes, received: str | None):
     if not received or not hmac.compare_digest(digest, received):
         raise HTTPException(401, "Invalid Shopify webhook signature")
 
+
 def require_admin(x_admin_key: str | None = Header(default=None)):
     if x_admin_key != settings.admin_api_key:
         raise HTTPException(401, "Invalid admin key")
 
+
 def new_token():
     return secrets.token_urlsafe(32)
+
 
 def props_to_dict(line):
     return {
@@ -96,12 +108,20 @@ def props_to_dict(line):
         if p.get("name")
     }
 
+
 def extract_personalized_line(payload):
     for line in payload.get("line_items") or []:
         p = props_to_dict(line)
         if p.get("Pet photo"):
             return line, p
     return None, None
+
+
+def customer_review_url(token: str) -> str:
+    base = settings.storefront_review_url.rstrip("?")
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}token={token}"
+
 
 def send_review_email(to_email, order_name, review_url):
     if not settings.smtp_host or not settings.smtp_from_email:
@@ -128,15 +148,19 @@ Nothing is sent to print until you approve the artwork.
             server.login(settings.smtp_username, settings.smtp_password)
         server.send_message(msg)
 
+
 class ArtworkInput(BaseModel):
     artwork_url: HttpUrl
     send_email: bool = True
 
+
 app = FastAPI(title="Mellowden Artwork Approval")
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.post("/webhooks/shopify/orders-create")
 async def orders_create(request: Request, db: Session = Depends(get_db)):
@@ -171,6 +195,7 @@ async def orders_create(request: Request, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
+
 @app.get("/admin/orders", dependencies=[Depends(require_admin)])
 def admin_orders(status: str | None = None, db: Session = Depends(get_db)):
     stmt = select(ApprovalOrder).order_by(ApprovalOrder.created_at.desc())
@@ -192,7 +217,9 @@ def admin_orders(status: str | None = None, db: Session = Depends(get_db)):
         "status": r.status,
         "revision_request": r.revision_request,
         "revision_count": r.revision_count,
+        "review_url": customer_review_url(r.approval_token),
     } for r in rows]
+
 
 @app.post("/admin/orders/{order_id}/artwork", dependencies=[Depends(require_admin)])
 def set_artwork(order_id: str, body: ArtworkInput, db: Session = Depends(get_db)):
@@ -202,9 +229,10 @@ def set_artwork(order_id: str, body: ArtworkInput, db: Session = Depends(get_db)
     row.artwork_url = str(body.artwork_url)
     row.approval_token = new_token()
     row.revision_request = ""
+    row.approved_at = None
     row.status = "WAITING_FOR_CUSTOMER_APPROVAL"
     db.commit()
-    review_url = f"{settings.app_base_url.rstrip('/')}/review/{row.approval_token}"
+    review_url = customer_review_url(row.approval_token)
     email_sent, email_error = False, None
     if body.send_email:
         try:
@@ -214,52 +242,157 @@ def set_artwork(order_id: str, body: ArtworkInput, db: Session = Depends(get_db)
             email_error = str(e)
     return {"ok": True, "review_url": review_url, "email_sent": email_sent, "email_error": email_error}
 
-def page(title, body):
-    return f"""<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
-<style>body{{background:#f7f2ea;color:#302923;font-family:Arial;margin:0}}main{{max-width:760px;margin:50px auto;padding:24px}}.card{{background:#fffaf4;border:1px solid #e3d8cd;border-radius:18px;padding:28px}}h1{{font-family:Georgia,serif}}img{{max-width:100%;max-height:650px;display:block;margin:auto;border-radius:10px}}button{{border:0;border-radius:999px;padding:14px 22px;margin:8px 8px 8px 0;font-size:16px;cursor:pointer}}.primary{{background:#8c6a56;color:white}}.secondary{{background:#eee4da}}textarea{{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #d7ccc1}}</style></head>
-<body><main><div style="letter-spacing:.18em;text-transform:uppercase;font-size:13px;margin-bottom:20px">Mellowden</div><div class=card><h1>{title}</h1>{body}</div></main></body></html>"""
+
+def page(title, body, eyebrow="Mellowden Portrait Review"):
+    safe_title = escape(title)
+    safe_eyebrow = escape(eyebrow)
+    return f"""<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{{--cream:#f5efe7;--paper:#fffaf4;--ink:#2f2925;--muted:#75675d;--line:#e6d9cc;--accent:#7b5f4d;--soft:#eee4da}}
+*{{box-sizing:border-box}}
+body{{background:var(--cream);color:var(--ink);font-family:Arial,sans-serif;margin:0}}
+main{{max-width:860px;margin:0 auto;padding:46px 22px 64px}}
+.eyebrow{{letter-spacing:.22em;text-transform:uppercase;font-size:12px;font-weight:700;color:var(--muted);margin-bottom:14px}}
+.card{{background:var(--paper);border:1px solid var(--line);border-radius:22px;padding:34px;box-shadow:0 18px 50px rgba(61,45,35,.06)}}
+h1{{font-family:Georgia,serif;font-size:clamp(34px,5vw,52px);line-height:1.05;margin:0 0 18px}}
+p{{font-size:17px;line-height:1.65;color:var(--muted)}}
+.meta{{font-size:14px;color:var(--muted);margin:0 0 22px}}
+.preview{{background:#f1ebe4;border:1px solid var(--line);border-radius:16px;padding:14px;margin:26px 0}}
+img{{max-width:100%;max-height:700px;display:block;margin:auto;border-radius:10px}}
+.actions{{display:flex;gap:10px;flex-wrap:wrap;margin-top:24px}}
+button{{border:0;border-radius:999px;padding:14px 22px;font-size:16px;cursor:pointer}}
+.primary{{background:var(--accent);color:white}}
+.secondary{{background:var(--soft);color:var(--ink)}}
+textarea{{width:100%;box-sizing:border-box;padding:14px;border-radius:12px;border:1px solid #d7ccc1;background:#fff;font:inherit;min-height:130px;margin-top:14px}}
+.note{{font-size:14px;margin-top:24px}}
+.status{{display:inline-block;padding:7px 11px;border-radius:999px;background:var(--soft);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:18px}}
+</style>
+</head>
+<body>
+<main>
+<div class="eyebrow">{safe_eyebrow}</div>
+<div class="card"><h1>{safe_title}</h1>{body}</div>
+</main>
+</body>
+</html>"""
+
+
+def invalid_review_page(message="This review link is invalid, expired, or has been replaced by a newer one."):
+    return HTMLResponse(
+        page(
+            "This review link is no longer valid",
+            f"<p>{escape(message)}</p><p class='note'>If you need a fresh link, reply to your Mellowden email and we’ll help you.</p>",
+        ),
+        status_code=404,
+    )
+
 
 @app.get("/review/{token}", response_class=HTMLResponse)
 def review(token: str, db: Session = Depends(get_db)):
     row = db.scalar(select(ApprovalOrder).where(ApprovalOrder.approval_token == token))
     if not row:
-        raise HTTPException(404, "Invalid or expired review link")
+        return invalid_review_page()
+
+    order_name = escape(row.order_name or "Your order")
+    pet_name = escape(row.pet_name or "")
+    product_title = escape(row.product_title or "Mellowden portrait")
+    meta = f"<p class='meta'>{order_name} · {product_title}{' · ' + pet_name if pet_name else ''}</p>"
+
+    if row.status == "WAITING_FOR_ARTWORK":
+        return page(
+            "We’re creating your portrait",
+            meta
+            + "<div class='status'>In progress</div>"
+            + "<p>Our artist is preparing your personalized artwork. There’s nothing you need to do yet.</p>"
+            + "<p class='note'>We’ll send you a review link as soon as your preview is ready.</p>",
+        )
+
+    if row.status == "REVISION_REQUESTED":
+        return page(
+            "Your changes are with our artist",
+            meta
+            + "<div class='status'>Revision requested</div>"
+            + "<p>Thanks for your feedback. We’re preparing an updated version of your portrait now.</p>"
+            + "<p class='note'>When the revision is ready, you’ll receive a fresh review link.</p>",
+        )
+
     if row.status == "APPROVED":
-        return page("Approved for printing", "<p>Thank you. Your artwork is approved.</p>")
+        return page(
+            "Approved for printing",
+            meta
+            + "<div class='status'>Approved</div>"
+            + "<p>Thank you. Your artwork has been approved and no further action is needed from you.</p>"
+            + "<p class='note'>We’ll now prepare your portrait for production.</p>",
+        )
+
     if row.status == "SENT_TO_PRINT":
-        return page("Sent to print", "<p>Your portrait has been sent to production.</p>")
+        return page(
+            "Your portrait is in production",
+            meta
+            + "<div class='status'>In production</div>"
+            + "<p>Your approved portrait has been sent to print.</p>"
+            + "<p class='note'>You’ll receive the usual order and shipping updates as production progresses.</p>",
+        )
+
+    if row.status != "WAITING_FOR_CUSTOMER_APPROVAL":
+        return page(
+            "Portrait review",
+            meta + "<p>This order isn’t currently awaiting an action.</p>",
+        )
+
     if not row.artwork_url:
-        raise HTTPException(409, "Artwork not ready")
+        return page(
+            "We’re creating your portrait",
+            meta + "<p>Your artwork preview isn’t ready yet. Please check back later.</p>",
+        )
+
+    artwork_url = escape(row.artwork_url, quote=True)
     body = f"""
-<p>{row.order_name}{' · ' + row.pet_name if row.pet_name else ''}</p>
-<img src="{row.artwork_url}" alt="Artwork preview">
-<form method=post action="/review/{token}/approve"><button class=primary>Approve for Printing</button></form>
-<button class=secondary onclick="document.getElementById('changes').hidden=false">Request Changes</button>
-<form id=changes hidden method=post action="/review/{token}/request-changes">
-<textarea name=message rows=5 maxlength=1500 required placeholder="Tell us what you'd like changed..."></textarea>
-<button class=secondary>Send change request</button>
+{meta}
+<div class="status">Ready for review</div>
+<p>Please look over your portrait carefully. Approve it when you’re happy, or tell us what you’d like adjusted.</p>
+<div class="preview"><img src="{artwork_url}" alt="Your Mellowden artwork preview"></div>
+<div class="actions">
+<form method="post" action="/review/{escape(token, quote=True)}/approve"><button class="primary">Approve for printing</button></form>
+<button class="secondary" type="button" onclick="document.getElementById('changes').hidden=false;this.hidden=true">Request changes</button>
+</div>
+<form id="changes" hidden method="post" action="/review/{escape(token, quote=True)}/request-changes">
+<textarea name="message" maxlength="1500" required placeholder="Tell us what you'd like changed..."></textarea>
+<button class="secondary" type="submit">Send change request</button>
 </form>
-<p><small>Nothing is sent to print until you approve this artwork.</small></p>
+<p class="note">Nothing is sent to print until you approve this artwork.</p>
 """
-    return page("Review your portrait", body)
+    return page("Your portrait is ready to review", body)
+
 
 @app.post("/review/{token}/approve", response_class=HTMLResponse)
 def approve(token: str, db: Session = Depends(get_db)):
     row = db.scalar(select(ApprovalOrder).where(ApprovalOrder.approval_token == token))
     if not row:
-        raise HTTPException(404, "Invalid or expired review link")
+        return invalid_review_page()
+    if row.status == "APPROVED":
+        return page("Approved for printing", "<p>Thank you. Your artwork is already approved.</p>")
     if row.status != "WAITING_FOR_CUSTOMER_APPROVAL":
         return page("No action needed", "<p>This artwork is no longer awaiting approval.</p>")
     row.status = "APPROVED"
     row.approved_at = datetime.utcnow()
     db.commit()
-    return page("Approved for printing", "<p>Thank you. We’ll now prepare your portrait for production.</p>")
+    return page(
+        "Approved for printing",
+        "<div class='status'>Approved</div><p>Thank you. We’ll now prepare your portrait for production.</p>",
+    )
+
 
 @app.post("/review/{token}/request-changes", response_class=HTMLResponse)
 def request_changes(token: str, message: str = Form(...), db: Session = Depends(get_db)):
     row = db.scalar(select(ApprovalOrder).where(ApprovalOrder.approval_token == token))
     if not row:
-        raise HTTPException(404, "Invalid or expired review link")
+        return invalid_review_page()
+    if row.status == "REVISION_REQUESTED":
+        return page("Changes received", "<p>Your change request is already with our artist.</p>")
     if row.status != "WAITING_FOR_CUSTOMER_APPROVAL":
         return page("No action needed", "<p>This artwork is no longer awaiting feedback.</p>")
     message = message.strip()
@@ -269,7 +402,11 @@ def request_changes(token: str, message: str = Form(...), db: Session = Depends(
     row.revision_count += 1
     row.status = "REVISION_REQUESTED"
     db.commit()
-    return page("Change request received", "<p>Thanks. We’ll prepare a revised preview and send you a new review link.</p>")
+    return page(
+        "Your changes are with our artist",
+        "<div class='status'>Revision requested</div><p>Thanks. We’ll prepare a revised preview and send you a fresh review link when it’s ready.</p>",
+    )
+
 
 @app.post("/admin/orders/{order_id}/mark-sent-to-print", dependencies=[Depends(require_admin)])
 def mark_sent_to_print(order_id: str, db: Session = Depends(get_db)):
