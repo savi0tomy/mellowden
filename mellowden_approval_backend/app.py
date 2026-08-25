@@ -10,6 +10,7 @@ from pydantic import BaseModel, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine, String, Text, Integer, DateTime, select
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, sessionmaker, Session
+from admin_dashboard import build_admin_router
 
 
 class Settings(BaseSettings):
@@ -155,6 +156,7 @@ class ArtworkInput(BaseModel):
 
 
 app = FastAPI(title="Mellowden Artwork Approval")
+app.include_router(build_admin_router(settings, SessionLocal, ApprovalOrder, new_token, customer_review_url))
 
 
 @app.get("/health")
