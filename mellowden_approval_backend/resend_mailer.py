@@ -13,7 +13,7 @@ REVISION_TEMPLATE = "mellowden-revision-requested"
 WEBHOOK_TOLERANCE_SECONDS = 300
 
 
-def _send_template(settings, *, to_email: str, template_id: str, variables: dict, idempotency_key: str):
+def _send_template(settings, *, to_email: str, template_id: str, variables: dict, idempotency_key: str, tags: dict):
     if not settings.resend_api_key:
         raise RuntimeError("RESEND_API_KEY is not configured")
     if not settings.resend_from_email:
@@ -29,6 +29,7 @@ def _send_template(settings, *, to_email: str, template_id: str, variables: dict
             "id": template_id,
             "variables": variables,
         },
+        "tags": [{"name": key, "value": str(value)[:256]} for key, value in tags.items() if value is not None],
     }
 
     request = Request(
@@ -71,6 +72,7 @@ def send_customer_review_email(settings, row, review_url: str):
             "REVIEW_URL": review_url,
         },
         idempotency_key=f"mellowden-review/{row.shopify_order_id}/{row.approval_token}",
+        tags={"order_id": row.shopify_order_id, "kind": "customer_review"},
     )
 
 
@@ -89,6 +91,7 @@ def send_owner_approved_email(settings, row):
             "ADMIN_URL": "https://mellowden-approval-backend-production.up.railway.app/admin",
         },
         idempotency_key=f"mellowden-approved/{row.shopify_order_id}/{row.approval_token}",
+        tags={"order_id": row.shopify_order_id, "kind": "owner_approved"},
     )
 
 
@@ -108,6 +111,7 @@ def send_owner_revision_email(settings, row, message: str):
             "ADMIN_URL": "https://mellowden-approval-backend-production.up.railway.app/admin",
         },
         idempotency_key=f"mellowden-revision/{row.shopify_order_id}/{row.approval_token}/{row.revision_count}",
+        tags={"order_id": row.shopify_order_id, "kind": "owner_revision"},
     )
 
 
